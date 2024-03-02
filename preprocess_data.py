@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+# Copyright (C) 2024 Charles O. Goddard
 """
 Preprocess the RedPajama sample dataset for training.
 
@@ -74,7 +76,7 @@ def chunkinate(ds, chunk_size):
         # pad the last chunk
         padding_size = chunk_size - len(current_chunk["input_ids"])
         if padding_size > 0:
-            current_chunk["input_ids"].extend([tokenizer.pad_token_id] * padding_size)
+            current_chunk["input_ids"].extend([tokenizer.eos_token_id] * padding_size)
             current_chunk["attention_mask"].extend([0] * padding_size)
         yield current_chunk
 
