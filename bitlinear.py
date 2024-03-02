@@ -14,11 +14,11 @@
 # along with this program. If not, see http://www.gnu.org/licenses/.
 
 
+from typing import Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from typing import Tuple
 
 
 def _ste(x: torch.Tensor, x0: torch.Tensor) -> torch.Tensor:
