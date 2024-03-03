@@ -100,7 +100,7 @@ class BitLlamaConfig(PretrainedConfig):
             The number of times each layer is repeated.
     """
 
-    model_type = "llama"
+    model_type = "bitllama"
     keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(

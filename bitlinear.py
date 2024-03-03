@@ -1,3 +1,14 @@
+"""
+Implementation of the BitLinear layer described in the papers:
+
+1. "BitNet: Scaling 1-bit Transformers for Large Language Models"
+2. "The Era of 1-bit LLMs: All Large Language Models are in 1.58 Bits"
+
+References:
+- https://arxiv.org/abs/2310.11453
+- https://arxiv.org/abs/2402.17764
+"""
+
 #!/usr/bin/env python3
 # Copyright (C) 2024 Charles O. Goddard
 
@@ -30,15 +41,37 @@ def _quant_roundclip(x: torch.Tensor, eps: float = 1e-9) -> torch.Tensor:
     return wp, gamma
 
 
+def _grouped_shape(x: torch.Tensor, is_weight: bool, group_size: Optional[int] = None):
+    if not group_size:
+        return x.shape
+
+    # weight:
+    # (out_features, in_features) -> (group_size, -1, in_features)
+    # (out_features) -> (group_size, -1)
+    if is_weight:
+        return tuple([group_size, -1] + list(x.shape[1:]))
+
+    # activation:
+    # (batch_size, seq_len, hidden_size) -> (batch_size, seq_len, group_size, -1)
+    # (batch_size, hidden_size) -> (batch_size, group_size, -1)
+    return tuple(list(x.shape[:-1]) + [group_size, -1])
+
+
 def quantize(
-    x: torch.Tensor, eps: float = 1e-9, mode: Literal["absmax", "roundclip"] = "absmax"
+    x: torch.Tensor,
+    eps: float = 1e-9,
+    mode: Literal["absmax", "roundclip"] = "absmax",
+    is_weight: bool = False,
+    group_size: Optional[int] = 128,
 ):
+    xp = x.view(*_grouped_shape(x, is_weight, group_size))
     if mode == "absmax":
-        return _quant_absmax(x, eps=eps)
+        res = _quant_absmax(xp, eps=eps)
     elif mode == "roundclip":
-        return _quant_roundclip(x, eps=eps)
+        res = _quant_roundclip(xp, eps=eps)
     else:
         raise ValueError(f"Unknown quantization mode {mode}")
+    return _ste(res[0].reshape_as(x), x), res[1]
 
 
 class BitLinear(nn.Linear):
@@ -63,29 +96,34 @@ class BitLinear(nn.Linear):
 
     def forward(self, x: torch.Tensor, eps: float = 1e-9):
         x = self.input_norm(x)
-        x0 = x
-
-        if self.group_size is not None:
-            x = x.view(-1, self.group_size, x.shape[-1])
-        x_q, gamma = quantize(x, eps=eps, mode=self.act_quantization)
-        x_q = x_q.reshape_as(x0)
+        x_q, gamma = quantize(
+            x,
+            eps=eps,
+            mode=self.act_quantization,
+            is_weight=False,
+            group_size=self.group_size,
+        )
 
         if self.bias is not None:
-            bias_q, _ = _ste(
-                quantize(self.bias, eps=eps, mode=self.weight_quantization),
-                self.bias.data,
-            )
+            bias_q, _ = quantize(
+                self.bias,
+                eps=eps,
+                mode=self.weight_quantization,
+                is_weight=True,
+                group_size=self.group_size,
+            )[0]
         else:
             bias_q = None
 
         w_q, beta = quantize(
-            self.weight.view(self.group_size or 1, -1),
+            self.weight,
             eps=eps,
             mode=self.weight_quantization,
+            is_weight=True,
+            group_size=self.group_size,
         )
-        w_q = w_q.reshape_as(self.weight)
 
-        y_q = F.linear(_ste(x_q, x0), _ste(w_q, self.weight), bias_q)
+        y_q = F.linear(x_q, w_q, bias_q)
 
         scale = gamma * beta if self.preserve_scale else 1
         y = y_q * scale / 128
