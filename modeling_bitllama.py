@@ -156,7 +156,7 @@ class BitLlamaDecoderLayer(nn.Module):
         if effective_idx is not None:
             self.self_attn.layer_idx = effective_idx
 
-        residual = hidden_states
+        h0 = hidden_states
 
         hidden_states = self.input_layernorm(hidden_states)
 
@@ -169,12 +169,12 @@ class BitLlamaDecoderLayer(nn.Module):
             use_cache=use_cache,
             padding_mask=padding_mask,
         )
-        hidden_states = residual + hidden_states
+        hidden_states = h0 + attention_output
 
-        residual = hidden_states
+        h1 = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
+        hidden_states = h1 + hidden_states
 
         outputs = (hidden_states,)
 
