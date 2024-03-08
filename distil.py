@@ -143,6 +143,7 @@ class DistillationTrainer(transformers.Trainer):
 @click.option("--save-total-limit", type=int, default=5)
 @click.option("--rope-offset/--no-rope-offset", is_flag=True, default=False)
 @click.option("--project", type=str, default=None)
+@click.option("--resume-from", type=str, default=None)
 def main(
     model: str,
     dataset: str,
@@ -170,6 +171,7 @@ def main(
     save_total_limit: int,
     rope_offset: bool,
     project: Optional[str],
+    resume_from: Optional[str],
 ):
     if num_workers is None:
         num_workers = multiprocessing.cpu_count()
@@ -188,7 +190,9 @@ def main(
             max_position_embeddings=student.config.max_position_embeddings,
         )
 
-    tokenizer = transformers.AutoTokenizer.from_pretrained(model)
+    tokenizer = transformers.LlamaTokenizer.from_pretrained(
+        model, trust_remote_code=trust_remote_code
+    )
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -242,6 +246,9 @@ def main(
         seed=seed,
         bf16=True,
         save_total_limit=save_total_limit,
+        torch_compile=False,
+        load_best_model_at_end=True,
+        resume_from_checkpoint=resume_from,
     )
 
     trainer = DistillationTrainer(
@@ -256,7 +263,8 @@ def main(
         tokenizer=tokenizer,
     )
 
-    trainer.train()
+    trainer.train(resume_from_checkpoint=resume_from)
+    trainer.save_model()
 
 
 def load_data(
@@ -305,4 +313,8 @@ def load_data(
 
 
 if __name__ == "__main__":
+    import torch._dynamo
+
+    torch._dynamo.config.suppress_errors = True
+
     main()
