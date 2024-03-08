@@ -37,7 +37,7 @@ def _quant_absmax(
 def _quant_roundclip(x: torch.Tensor, eps: float = 1e-9) -> torch.Tensor:
     gamma = x.abs().mean(dim=-1, keepdim=True)
     wp = x / (gamma + eps)
-    wp = wp.round().clamp(-1, 1)
+    wp = wp.round().clamp(-1, 1).to(torch.int8)
     return wp, gamma
 
 
@@ -57,6 +57,7 @@ def _grouped_shape(x: torch.Tensor, is_weight: bool, group_size: Optional[int] =
     return tuple(list(x.shape[:-1]) + [group_size, -1])
 
 
+@torch.compile()
 def quantize(
     x: torch.Tensor,
     eps: float = 1e-9,
@@ -71,7 +72,10 @@ def quantize(
         res = _quant_roundclip(xp, eps=eps)
     else:
         raise ValueError(f"Unknown quantization mode {mode}")
-    return _ste(res[0].reshape_as(x), x), res[1]
+
+    x0_scaled = (xp / res[1]).reshape_as(x)
+    x_q = res[0].reshape_as(x)
+    return _ste(x_q, x0_scaled), res[1]
 
 
 class BitLinear(nn.Linear):
@@ -82,7 +86,7 @@ class BitLinear(nn.Linear):
         preserve_scale: bool = False,
         weight_quantization: Literal["absmax", "roundclip"] = "roundclip",
         act_quantization: Literal["absmax", "roundclip"] = "absmax",
-        group_size: Optional[int] = 128,
+        group_size: Optional[int] = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -94,16 +98,17 @@ class BitLinear(nn.Linear):
         self.act_quantization = act_quantization
         self.group_size = group_size
 
-    def forward(self, x: torch.Tensor, eps: float = 1e-9):
-        x = self.input_norm(x)
-        x_q, gamma = quantize(
-            x,
-            eps=eps,
-            mode=self.act_quantization,
-            is_weight=False,
-            group_size=self.group_size,
-        )
+        if group_size:
+            if preserve_scale:
+                raise ValueError("Cannot preserve scale with group size")
 
+            if self.in_features % group_size != 0:
+                raise ValueError("Input size must be divisible by group size")
+
+            if self.out_features % group_size != 0:
+                raise ValueError("Output size must be divisible by group size")
+
+    def quantized_weights(self, eps: float = 1e-9):
         if self.bias is not None:
             bias_q, _ = quantize(
                 self.bias,
@@ -111,7 +116,7 @@ class BitLinear(nn.Linear):
                 mode=self.weight_quantization,
                 is_weight=True,
                 group_size=self.group_size,
-            )[0]
+            )[0].to(torch.float16)
         else:
             bias_q = None
 
@@ -122,7 +127,20 @@ class BitLinear(nn.Linear):
             is_weight=True,
             group_size=self.group_size,
         )
+        return w_q, bias_q, beta
 
+    @torch.compile()
+    def forward(self, x: torch.Tensor, eps: float = 1e-9):
+        x = self.input_norm(x)
+        x_q, gamma = quantize(
+            x,
+            eps=eps,
+            mode=self.act_quantization,
+            is_weight=False,
+            group_size=self.group_size,
+        )
+
+        w_q, bias_q, beta = self.quantized_weights(eps=eps)
         y_q = F.linear(x_q, w_q, bias_q)
 
         scale = gamma * beta if self.preserve_scale else 1
