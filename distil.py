@@ -189,6 +189,8 @@ def main(
         )
 
     tokenizer = transformers.AutoTokenizer.from_pretrained(model)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
     teacher_kwargs = {
         "device_map": teacher_device,
