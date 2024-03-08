@@ -143,6 +143,6 @@ class BitLinear(nn.Linear):
         w_q, bias_q, beta = self.quantized_weights(eps=eps)
         y_q = F.linear(x_q, w_q, bias_q)
 
-        scale = gamma * beta if self.preserve_scale else 1
+        scale = beta if self.preserve_scale else 1
         y = y_q * scale / 128
         return y

@@ -61,9 +61,27 @@ class BitLlamaMLP(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        self.gate_proj = BitLinear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = BitLinear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = BitLinear(self.intermediate_size, self.hidden_size, bias=False)
+        self.gate_proj = BitLinear(
+            self.hidden_size,
+            self.intermediate_size,
+            bias=False,
+            elementwise_affine=config.norm_affine,
+            preserve_scale=config.preserve_scale,
+        )
+        self.up_proj = BitLinear(
+            self.hidden_size,
+            self.intermediate_size,
+            bias=False,
+            elementwise_affine=config.norm_affine,
+            preserve_scale=config.preserve_scale,
+        )
+        self.down_proj = BitLinear(
+            self.intermediate_size,
+            self.hidden_size,
+            bias=False,
+            elementwise_affine=config.norm_affine,
+            preserve_scale=config.preserve_scale,
+        )
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
@@ -92,16 +110,32 @@ class BitLlamaAttention(LlamaAttention):
                 f" and `num_heads`: {self.num_heads})."
             )
         self.q_proj = BitLinear(
-            self.hidden_size, self.num_heads * self.head_dim, bias=False
+            self.hidden_size,
+            self.num_heads * self.head_dim,
+            bias=config.attention_bias,
+            elementwise_affine=config.norm_affine,
+            preserve_scale=config.preserve_scale,
         )
         self.k_proj = BitLinear(
-            self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False
+            self.hidden_size,
+            self.num_key_value_heads * self.head_dim,
+            bias=config.attention_bias,
+            elementwise_affine=config.norm_affine,
+            preserve_scale=config.preserve_scale,
         )
         self.v_proj = BitLinear(
-            self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False
+            self.hidden_size,
+            self.num_key_value_heads * self.head_dim,
+            bias=config.attention_bias,
+            elementwise_affine=config.norm_affine,
+            preserve_scale=config.preserve_scale,
         )
         self.o_proj = BitLinear(
-            self.num_heads * self.head_dim, self.hidden_size, bias=False
+            self.num_heads * self.head_dim,
+            self.hidden_size,
+            bias=config.attention_bias,
+            elementwise_affine=config.norm_affine,
+            preserve_scale=config.preserve_scale,
         )
 
         self._init_rope()
@@ -171,10 +205,16 @@ class BitLlamaDecoderLayer(nn.Module):
         )
         hidden_states = h0 + attention_output
 
-        h1 = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = h1 + hidden_states
+        if self.config.newton_steps:
+            for _ in range(self.config.newton_steps):
+                h1 = self.post_attention_layernorm(hidden_states)
+                dh_dt = self.mlp(h1)
+                hidden_states = hidden_states - dh_dt / 2
+        else:
+            h1 = hidden_states
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = self.mlp(hidden_states)
+            hidden_states = h1 + hidden_states
 
         outputs = (hidden_states,)
 

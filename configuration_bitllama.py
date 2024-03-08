@@ -98,6 +98,13 @@ class BitLlamaConfig(PretrainedConfig):
             The dropout ratio for the attention probabilities.
         layer_repeat (`int`, *optional*, defaults to 1):
             The number of times each layer is repeated.
+        newton_steps (`int`, *optional*):
+            If set, self-attention + feedforward layer output will be used as a gradient for Newton's method. This
+            parameter specifies the number of steps to take.
+        norm_affine (`bool`, *optional*, defaults to `False`):
+            Whether to use element-wise affine transformation in the normalization layers.
+        preserve_scale (`bool`, *optional*, defaults to `False`):
+            Whether to preserve the scale of the input and weights of BitLinear layers.
     """
 
     model_type = "bitllama"
@@ -126,6 +133,9 @@ class BitLlamaConfig(PretrainedConfig):
         attention_bias=False,
         attention_dropout=0.0,
         layer_repeat=1,
+        newton_steps=None,
+        norm_affine=False,
+        preserve_scale=False,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -134,6 +144,8 @@ class BitLlamaConfig(PretrainedConfig):
         self.intermediate_size = intermediate_size
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads
+        self.norm_affine = norm_affine
+        self.preserve_scale = preserve_scale
 
         # for backward compatibility
         if num_key_value_heads is None:
@@ -151,6 +163,7 @@ class BitLlamaConfig(PretrainedConfig):
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
         self.layer_repeat = layer_repeat
+        self.newton_steps = newton_steps
 
         super().__init__(
             pad_token_id=pad_token_id,
