@@ -116,7 +116,7 @@ class BitLinear(nn.Linear):
                 mode=self.weight_quantization,
                 is_weight=True,
                 group_size=self.group_size,
-            )[0].to(torch.float16)
+            )
         else:
             bias_q = None
 
