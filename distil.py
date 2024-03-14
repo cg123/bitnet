@@ -2,16 +2,17 @@
 # 3/7/2024
 # Copyright (C) 2024 Charles O. Goddard
 
+import multiprocessing
 from typing import Optional
+
+import click
+import datasets
 import torch
 import transformers
-import datasets
-import click
-import multiprocessing
-import wandb
 from transformers.utils import is_apex_available
-from llama_rope_offset import llama_patch_rope_offset, llama_set_rope_offset
 
+import wandb
+from llama_rope_offset import llama_patch_rope_offset, llama_set_rope_offset
 
 if is_apex_available():
     from apex import amp
@@ -45,17 +46,14 @@ class DistillationTrainer(transformers.Trainer):
         with torch.no_grad():
             teacher_output = self.teacher(**inputs)
 
-        distillation_loss = (
-            self.loss_fct(
-                torch.nn.functional.log_softmax(
-                    student_output.logits / self.temperature, dim=-1
-                ),
-                torch.nn.functional.softmax(
-                    teacher_output.logits / self.temperature, dim=-1
-                ).to(device=student_output.logits.device),
-            )
-            * self.temperature**2
-        )
+        distillation_loss = self.loss_fct(
+            torch.nn.functional.log_softmax(
+                student_output.logits / self.temperature, dim=-1
+            ),
+            torch.nn.functional.softmax(
+                teacher_output.logits / self.temperature, dim=-1
+            ).to(device=student_output.logits.device),
+        ) * (self.temperature**2)
 
         student_loss = student_output.loss
         loss = (1 - self.kl_weight) * student_loss + self.kl_weight * distillation_loss
@@ -77,6 +75,7 @@ class DistillationTrainer(transformers.Trainer):
         )
         self.rope_offset = new_offset
         llama_set_rope_offset(model, self.rope_offset)
+
         return control
 
     def on_step_end(self, model, **kwargs):

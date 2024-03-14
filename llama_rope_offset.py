@@ -3,7 +3,6 @@
 
 import torch
 import transformers
-from transformers.models.llama.modeling_llama import LlamaModel
 
 
 class LlamaOffsetRope(torch.nn.Module):
