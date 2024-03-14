@@ -65,21 +65,18 @@ class BitLlamaMLP(nn.Module):
             self.hidden_size,
             self.intermediate_size,
             bias=False,
-            elementwise_affine=config.norm_affine,
             preserve_scale=config.preserve_scale,
         )
         self.up_proj = BitLinear(
             self.hidden_size,
             self.intermediate_size,
             bias=False,
-            elementwise_affine=config.norm_affine,
             preserve_scale=config.preserve_scale,
         )
         self.down_proj = BitLinear(
             self.intermediate_size,
             self.hidden_size,
             bias=False,
-            elementwise_affine=config.norm_affine,
             preserve_scale=config.preserve_scale,
         )
         self.act_fn = ACT2FN[config.hidden_act]
@@ -89,7 +86,7 @@ class BitLlamaMLP(nn.Module):
 
 
 class BitLlamaAttention(LlamaAttention):
-    def __init__(self, config: BitLlamaConfig):
+    def __init__(self, config: BitLlamaConfig, layer_idx: Optional[int] = None):
         nn.Module.__init__(self)
 
         self.config = config
@@ -103,6 +100,7 @@ class BitLlamaAttention(LlamaAttention):
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = config.rope_theta
         self.is_causal = True
+        self.layer_idx = layer_idx
 
         if (self.head_dim * self.num_heads) != self.hidden_size:
             raise ValueError(
@@ -113,28 +111,24 @@ class BitLlamaAttention(LlamaAttention):
             self.hidden_size,
             self.num_heads * self.head_dim,
             bias=config.attention_bias,
-            elementwise_affine=config.norm_affine,
             preserve_scale=config.preserve_scale,
         )
         self.k_proj = BitLinear(
             self.hidden_size,
             self.num_key_value_heads * self.head_dim,
             bias=config.attention_bias,
-            elementwise_affine=config.norm_affine,
             preserve_scale=config.preserve_scale,
         )
         self.v_proj = BitLinear(
             self.hidden_size,
             self.num_key_value_heads * self.head_dim,
             bias=config.attention_bias,
-            elementwise_affine=config.norm_affine,
             preserve_scale=config.preserve_scale,
         )
         self.o_proj = BitLinear(
             self.num_heads * self.head_dim,
             self.hidden_size,
             bias=config.attention_bias,
-            elementwise_affine=config.norm_affine,
             preserve_scale=config.preserve_scale,
         )
 
@@ -164,9 +158,9 @@ class BitLlamaDecoderLayer(nn.Module):
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
         self.self_attn = (
-            BitLlamaAttention(config=config)
+            BitLlamaAttention(config=config, layer_idx=layer_idx)
             if not getattr(config, "_flash_attn_2_enabled", False)
-            else BitLlamaFlashAttention2(config)
+            else BitLlamaFlashAttention2(config, layer_idx=layer_idx)
         )
         self.mlp = BitLlamaMLP(config)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -182,20 +176,13 @@ class BitLlamaDecoderLayer(nn.Module):
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
-        effective_idx: Optional[int] = None,
         padding_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[
         torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]
     ]:
-        if effective_idx is not None:
-            self.self_attn.layer_idx = effective_idx
-
-        h0 = hidden_states
-
-        hidden_states = self.input_layernorm(hidden_states)
-
+        h_0 = self.input_layernorm(hidden_states)
         attention_output, self_attn_weights, present_key_value = self.self_attn(
-            hidden_states=hidden_states,
+            hidden_states=h_0,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_value=past_key_value,
@@ -203,18 +190,16 @@ class BitLlamaDecoderLayer(nn.Module):
             use_cache=use_cache,
             padding_mask=padding_mask,
         )
-        hidden_states = h0 + attention_output
+        hidden_states = hidden_states + attention_output
 
-        if self.config.newton_steps:
-            for _ in range(self.config.newton_steps):
-                h1 = self.post_attention_layernorm(hidden_states)
-                dh_dt = self.mlp(h1)
-                hidden_states = hidden_states - dh_dt / 2
+        h_1 = self.post_attention_layernorm(hidden_states)
+        if self.config.euler_steps:
+            for _ in range(self.config.euler_steps):
+                dh_dt = self.mlp(h_1)
+                h_1 = h_1 + dh_dt / self.config.euler_steps
         else:
-            h1 = hidden_states
-            hidden_states = self.post_attention_layernorm(hidden_states)
-            hidden_states = self.mlp(hidden_states)
-            hidden_states = h1 + hidden_states
+            h_1 = self.mlp(h_1)
+        hidden_states = hidden_states + h_1
 
         outputs = (hidden_states,)
 
@@ -398,43 +383,38 @@ class BitLlamaModel(BitLlamaPreTrainedModel):
         all_self_attns = () if output_attentions else None
         next_decoder_cache = None
 
-        _layer_idx = 0
-        for decoder_layer in self.layers:
-            for _ in range(max(1, self.config.layer_repeat)):
-                if output_hidden_states:
-                    all_hidden_states += (hidden_states,)
+        for idx, decoder_layer in enumerate(self.layers):
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
 
-                if self.gradient_checkpointing and self.training:
-                    layer_outputs = self._gradient_checkpointing_func(
-                        decoder_layer.__call__,
-                        hidden_states,
-                        attention_mask,
-                        position_ids,
-                        past_key_values,
-                        output_attentions,
-                        use_cache,
-                        _layer_idx,
-                    )
-                else:
-                    layer_outputs = decoder_layer(
-                        hidden_states,
-                        attention_mask=attention_mask,
-                        position_ids=position_ids,
-                        past_key_value=past_key_values,
-                        output_attentions=output_attentions,
-                        use_cache=use_cache,
-                        effective_idx=_layer_idx,
-                    )
+            if self.gradient_checkpointing and self.training:
+                layer_outputs = self._gradient_checkpointing_func(
+                    decoder_layer.__call__,
+                    hidden_states,
+                    attention_mask,
+                    position_ids,
+                    past_key_values,
+                    output_attentions,
+                    use_cache,
+                    idx,
+                )
+            else:
+                layer_outputs = decoder_layer(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_values,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                )
 
-                hidden_states = layer_outputs[0]
+            hidden_states = layer_outputs[0]
 
-                if use_cache:
-                    next_decoder_cache = layer_outputs[2 if output_attentions else 1]
+            if use_cache:
+                next_decoder_cache = layer_outputs[2 if output_attentions else 1]
 
-                if output_attentions:
-                    all_self_attns += (layer_outputs[1],)
-
-                _layer_idx += 1
+            if output_attentions:
+                all_self_attns += (layer_outputs[1],)
 
         hidden_states = self.norm(hidden_states)
 

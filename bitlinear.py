@@ -12,7 +12,8 @@ References:
 #!/usr/bin/env python3
 # Copyright (C) 2024 Charles O. Goddard
 
-from typing import Literal, Optional, Tuple
+import math
+from typing import NamedTuple, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -24,125 +25,148 @@ def _ste(x: torch.Tensor, x0: torch.Tensor) -> torch.Tensor:
     return x0 + (x - x0).detach()
 
 
-def _quant_absmax(
-    x: torch.Tensor, eps: float = 1e-9
+@torch.compile()
+def _quantize(
+    x: Optional[torch.Tensor], is_input: bool, num_groups: int, eps: float
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    x_absmax = x.abs().max(dim=-1, keepdim=True).values
-    x_q = (x * 128) / x_absmax.clamp(min=eps)
-    x_q = x_q.clip(-128 + eps, 127 - eps).to(torch.int8)
+    if x is None:
+        return None, None
 
-    return x_q, x_absmax
+    x0 = x
+    if is_input:
+        # split last dimension into num_groups
+        x = x.view(list(x.shape[:-1]) + [num_groups, -1])
+        scale_factor = x.abs().max(dim=-1, keepdim=True).values
+    else:
+        # first dimension is output features, so split that
+        x = x.view([num_groups, -1] + list(x.shape[1:]))
+        scale_factor = x.abs().mean(dim=list(range(1, len(x.shape))), keepdim=True)
+
+    x_scaled = x / (scale_factor + eps)
+    if is_input:
+        x_q = (x_scaled * 127).clamp(-127, 127).to(torch.int8)
+    else:
+        x_q = x_scaled.round().clamp(-1, 1).to(torch.int8)
+
+        # adjust scale_factor to match shape returned for input
+        scale_factor = scale_factor.view(1, 1, num_groups, 1)
+
+    return _ste(x_q, x_scaled).view_as(x0), scale_factor
 
 
-def _quant_roundclip(x: torch.Tensor, eps: float = 1e-9) -> torch.Tensor:
-    gamma = x.abs().mean(dim=-1, keepdim=True)
-    wp = x / (gamma + eps)
-    wp = wp.round().clamp(-1, 1).to(torch.int8)
-    return wp, gamma
+class QuantizedWeights(NamedTuple):
+    """Quantized weight and optional bias tensor for BitLinear."""
 
-
-def _grouped_shape(x: torch.Tensor, is_weight: bool, group_size: Optional[int] = None):
-    if not group_size:
-        return x.shape
-
-    # weight:
-    # (out_features, in_features) -> (group_size, -1, in_features)
-    # (out_features) -> (group_size, -1)
-    if is_weight:
-        return tuple([group_size, -1] + list(x.shape[1:]))
-
-    # activation:
-    # (batch_size, seq_len, hidden_size) -> (batch_size, seq_len, group_size, -1)
-    # (batch_size, hidden_size) -> (batch_size, group_size, -1)
-    return tuple(list(x.shape[:-1]) + [group_size, -1])
+    w_q: torch.Tensor
+    bias_q: Optional[torch.Tensor]
+    beta: torch.Tensor
 
 
 @torch.compile()
-def quantize(
-    x: torch.Tensor,
-    eps: float = 1e-9,
-    mode: Literal["absmax", "roundclip"] = "absmax",
-    is_weight: bool = False,
-    group_size: Optional[int] = 128,
-):
-    xp = x.view(*_grouped_shape(x, is_weight, group_size))
-    if mode == "absmax":
-        res = _quant_absmax(xp, eps=eps)
-    elif mode == "roundclip":
-        res = _quant_roundclip(xp, eps=eps)
-    else:
-        raise ValueError(f"Unknown quantization mode {mode}")
+def _quantize_weights(
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    num_groups: int,
+    eps: float,
+) -> QuantizedWeights:
+    w_q, beta = _quantize(weight, is_input=False, num_groups=num_groups, eps=eps)
+    bias_q, _ = _quantize(bias, is_input=True, num_groups=num_groups, eps=eps)
+    # bias assumes the scale factor of weights
+    return QuantizedWeights(w_q=w_q, bias_q=bias_q, beta=beta)
 
-    x0_scaled = (xp / res[1]).reshape_as(x)
-    x_q = res[0].reshape_as(x)
-    return _ste(x_q, x0_scaled), res[1]
+
+def _pack_ternary(x: torch.Tensor) -> torch.Tensor:
+    """Pack ternary float tensor into int8 tensor. Uses ~1.6 bits per element."""
+
+    x_packed = torch.empty(
+        x.shape[:-1] + (math.ceil(x.shape[-1] / 5)), dtype=torch.int8
+    )
+    for i in range(0, x.shape[-1], 5):
+        chunk = x[..., i : i + 5].to(torch.int8).view(x.shape[:-1] + (1, 5))
+        # -1 -> 0, 0 -> 1, 1 -> 2
+        chunk = chunk + 1
+        # store as base-3 number
+        chunk = (
+            chunk
+            * torch.tensor([1, 3, 9, 27, 81], device=chunk.device, dtype=chunk.dtype)
+        ).sum(dim=-1)
+        x_packed[..., i // 5] = chunk
+    return x_packed
 
 
 class BitLinear(nn.Linear):
     def __init__(
         self,
+        in_features: int,
+        out_features: int,
         *args,
-        elementwise_affine: bool = False,
         preserve_scale: bool = False,
-        weight_quantization: Literal["absmax", "roundclip"] = "roundclip",
-        act_quantization: Literal["absmax", "roundclip"] = "absmax",
-        group_size: Optional[int] = None,
+        num_groups: int = 1,
+        eps: float = 1e-7,
+        bias: bool = False,
         **kwargs,
     ):
-        super().__init__(*args, **kwargs)
-        self.input_norm = nn.LayerNorm(
-            self.in_features, elementwise_affine=elementwise_affine
-        )
+        if num_groups < 1:
+            raise ValueError("num_groups must be >= 1")
+        if num_groups > 1 and out_features % num_groups != 0:
+            raise ValueError("out_features must be divisible by num_groups")
+
+        super().__init__(in_features, out_features, *args, bias=bias, **kwargs)
+        self.input_norm = nn.LayerNorm(self.in_features, elementwise_affine=False)
         self.preserve_scale = preserve_scale
-        self.weight_quantization = weight_quantization
-        self.act_quantization = act_quantization
-        self.group_size = group_size
-
-        if group_size:
-            if preserve_scale:
-                raise ValueError("Cannot preserve scale with group size")
-
-            if self.in_features % group_size != 0:
-                raise ValueError("Input size must be divisible by group size")
-
-            if self.out_features % group_size != 0:
-                raise ValueError("Output size must be divisible by group size")
-
-    def quantized_weights(self, eps: float = 1e-9):
-        if self.bias is not None:
-            bias_q, _ = quantize(
-                self.bias,
-                eps=eps,
-                mode=self.weight_quantization,
-                is_weight=True,
-                group_size=self.group_size,
-            )
-        else:
-            bias_q = None
-
-        w_q, beta = quantize(
-            self.weight,
-            eps=eps,
-            mode=self.weight_quantization,
-            is_weight=True,
-            group_size=self.group_size,
-        )
-        return w_q, bias_q, beta
+        self.num_groups = num_groups
+        self.eps = eps
 
     @torch.compile()
-    def forward(self, x: torch.Tensor, eps: float = 1e-9):
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         x = self.input_norm(x)
-        x_q, gamma = quantize(
-            x,
-            eps=eps,
-            mode=self.act_quantization,
-            is_weight=False,
-            group_size=self.group_size,
+        x_q, gamma = _quantize(
+            x, is_input=True, num_groups=self.num_groups, eps=self.eps
+        )
+        w_q, bias_q, beta = _quantize_weights(
+            self.weight, self.bias, num_groups=self.num_groups, eps=self.eps
         )
 
-        w_q, bias_q, beta = self.quantized_weights(eps=eps)
-        y_q = F.linear(x_q, w_q, bias_q)
+        y = F.linear(x_q, w_q, bias_q)
+        y = y.to(x.dtype) / 127
+        if self.preserve_scale:
+            y_grouped = y.view(list(y.shape[:-1]) + [self.num_groups, -1])
+            y = (y_grouped * gamma * beta).reshape_as(y)
 
-        scale = beta if self.preserve_scale else 1
-        y = y_q * scale / 128
+        return y
+
+
+class BitConv2d(nn.Conv2d):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        *args,
+        preserve_scale: bool = False,
+        eps: float = 1e-7,
+        bias: bool = False,
+        **kwargs,
+    ):
+        super().__init__(
+            in_channels, out_channels, kernel_size, *args, bias=bias, **kwargs
+        )
+        self.input_norm = nn.GroupNorm(1, self.in_channels, affine=False)
+        self.preserve_scale = preserve_scale
+        self.eps = eps
+
+    @torch.compile()
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        x = self.input_norm(x)
+        x_q, gamma = _quantize(x, is_input=True, num_groups=1, eps=self.eps)
+        w_q, bias_q, beta = _quantize_weights(
+            self.weight, self.bias, num_groups=1, eps=self.eps
+        )
+
+        y = F.conv2d(x_q, w_q, bias_q, self.stride, self.padding, self.dilation)
+        y = y.to(x.dtype) / 127
+        if self.preserve_scale:
+            y_grouped = y.view(list(y.shape[:-1]) + [1, -1])
+            y = (y_grouped * gamma * beta).reshape_as(y)
+
         return y

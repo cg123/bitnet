@@ -96,13 +96,8 @@ class BitLlamaConfig(PretrainedConfig):
             Whether to use a bias in the query, key, value and output projection layers during self-attention.
         attention_dropout (`float`, *optional*, defaults to 0.0):
             The dropout ratio for the attention probabilities.
-        layer_repeat (`int`, *optional*, defaults to 1):
-            The number of times each layer is repeated.
-        newton_steps (`int`, *optional*):
-            If set, self-attention + feedforward layer output will be used as a gradient for Newton's method. This
-            parameter specifies the number of steps to take.
-        norm_affine (`bool`, *optional*, defaults to `False`):
-            Whether to use element-wise affine transformation in the normalization layers.
+        euler_steps (`int`, *optional*):
+            If set, feedforward layer output will be interpreted as a gradient and integrated using the Euler method.
         preserve_scale (`bool`, *optional*, defaults to `False`):
             Whether to preserve the scale of the input and weights of BitLinear layers.
     """
@@ -132,9 +127,7 @@ class BitLlamaConfig(PretrainedConfig):
         rope_scaling=None,
         attention_bias=False,
         attention_dropout=0.0,
-        layer_repeat=1,
-        newton_steps=None,
-        norm_affine=False,
+        euler_steps=None,
         preserve_scale=False,
         **kwargs,
     ):
@@ -144,7 +137,6 @@ class BitLlamaConfig(PretrainedConfig):
         self.intermediate_size = intermediate_size
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads
-        self.norm_affine = norm_affine
         self.preserve_scale = preserve_scale
 
         # for backward compatibility
@@ -162,8 +154,7 @@ class BitLlamaConfig(PretrainedConfig):
         self._rope_scaling_validation()
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
-        self.layer_repeat = layer_repeat
-        self.newton_steps = newton_steps
+        self.euler_steps = euler_steps
 
         super().__init__(
             pad_token_id=pad_token_id,
