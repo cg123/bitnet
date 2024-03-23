@@ -37,19 +37,18 @@ class BitMNIST(nn.Module):
     def __init__(
         self,
         num_classes: int = 10,
-        num_groups: int = 1,
         eps: float = 1e-7,
     ):
         super().__init__()
         self.conv1 = BitConv2d(1, 32, eps=eps, kernel_size=5, stride=1, padding=1)
         self.conv2 = BitConv2d(32, 64, eps=eps, kernel_size=5, stride=1, padding=1)
         self.fc = nn.Sequential(
-            BitLinear(64 * 5 * 5, 64, num_groups=num_groups, eps=eps),
+            BitLinear(64 * 5 * 5, 64, eps=eps),
             nn.SiLU(),
-            # BitLinear(256, 128, num_groups=num_groups, eps=eps),
+            # BitLinear(256, 128, eps=eps),
             # nn.ReLU(),
             BitEuler(64, 256, max_iter=16),
-            BitLinear(64, num_classes, num_groups=num_groups, eps=eps),
+            BitLinear(64, num_classes, eps=eps),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -188,7 +187,7 @@ def main():
     torch.manual_seed(467895)
 
     wandb.init(project="bitlinear-mnist")
-    model = BitMNIST(num_groups=2, num_classes=62).cuda()
+    model = BitMNIST(num_classes=62).cuda()
     print(f"{sum(x.numel() for x in model.parameters()) // 1000}k parameters")
     model = torch.compile(model)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)

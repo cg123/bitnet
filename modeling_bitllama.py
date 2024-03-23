@@ -27,25 +27,19 @@ from torch import nn
 from torch.nn import CrossEntropyLoss
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
-from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask
-from transformers.modeling_outputs import (
-    BaseModelOutputWithPast,
-    CausalLMOutputWithPast,
-)
+from transformers.modeling_attn_mask_utils import \
+    _prepare_4d_causal_attention_mask
+from transformers.modeling_outputs import (BaseModelOutputWithPast,
+                                           CausalLMOutputWithPast)
 from transformers.modeling_utils import PreTrainedModel
-from transformers.models.llama.modeling_llama import (
-    LLAMA_INPUTS_DOCSTRING,
-    LlamaAttention,
-    LlamaFlashAttention2,
-    LlamaRMSNorm,
-)
-from transformers.utils import (
-    add_start_docstrings,
-    add_start_docstrings_to_model_forward,
-    is_flash_attn_greater_or_equal_2_10,
-    logging,
-    replace_return_docstrings,
-)
+from transformers.models.llama.modeling_llama import (LLAMA_INPUTS_DOCSTRING,
+                                                      LlamaAttention,
+                                                      LlamaFlashAttention2,
+                                                      LlamaRMSNorm)
+from transformers.utils import (add_start_docstrings,
+                                add_start_docstrings_to_model_forward,
+                                is_flash_attn_greater_or_equal_2_10, logging,
+                                replace_return_docstrings)
 
 from .bitlinear import BitLinear
 from .configuration_bitllama import BitLlamaConfig
@@ -163,10 +157,6 @@ class BitLlamaDecoderLayer(nn.Module):
             else BitLlamaFlashAttention2(config, layer_idx=layer_idx)
         )
         self.mlp = BitLlamaMLP(config)
-        self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = LlamaRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
 
     def forward(
         self,
@@ -180,9 +170,8 @@ class BitLlamaDecoderLayer(nn.Module):
     ) -> Tuple[
         torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]
     ]:
-        h_0 = self.input_layernorm(hidden_states)
         attention_output, self_attn_weights, present_key_value = self.self_attn(
-            hidden_states=h_0,
+            hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_value=past_key_value,
@@ -192,7 +181,7 @@ class BitLlamaDecoderLayer(nn.Module):
         )
         hidden_states = hidden_states + attention_output
 
-        h_1 = self.post_attention_layernorm(hidden_states)
+        h_1 = hidden_states
         if self.config.euler_steps:
             for _ in range(self.config.euler_steps):
                 dh_dt = self.mlp(h_1)
