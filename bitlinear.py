@@ -27,16 +27,29 @@ def _ste(x: torch.Tensor, x0: torch.Tensor) -> torch.Tensor:
 
 @torch.compile()
 def _quantize(
-    x: Optional[torch.Tensor], is_activation: bool, eps: float
+    x: Optional[torch.Tensor],
+    is_activation: bool,
+    eps: float,
+    conv: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if x is None:
         return None, None
 
     if is_activation:
-        scale = 127.0 / x.abs().max(dim=-1, keepdim=True).values.clamp_(min=eps)
+        if conv:
+            # (batch_sz, hidden_sz, ...)
+            absmax: torch.Tensor = (
+                x.abs().view(x.shape[0], -1).max(dim=-1, keepdim=True).values
+            )
+            while len(absmax.shape) < len(x.shape):
+                absmax = absmax.unsqueeze(-1)
+        else:
+            # (batch_sz, seq_len, hidden_sz)
+            absmax = x.abs().max(dim=-1, keepdim=True).values
+        scale = 127.0 / absmax.clamp_(min=eps)
         x_q = (x * scale).round().clamp_(-128, 127)
     else:
-        scale = x.abs().mean().clamp_(min=eps)
+        scale = 1.0 / x.abs().mean().clamp_(min=eps)
         x_q = (x * scale).round().clamp_(-1, 1)
 
     return _ste(x_q, x), scale
@@ -56,8 +69,8 @@ def _quantize_weights(
     bias: Optional[torch.Tensor],
     eps: float,
 ) -> QuantizedWeights:
-    w_q, beta = _quantize(weight, is_activation=False, eps=eps)
-    bias_q, _ = _quantize(bias, is_activation=True, eps=eps)
+    w_q, beta = _quantize(weight, is_activation=False, eps=eps, conv=False)
+    bias_q, _ = _quantize(bias, is_activation=True, eps=eps, conv=False)
     # bias assumes the scale factor of weights
     return QuantizedWeights(w_q=w_q, bias_q=bias_q, beta=beta)
 
@@ -100,7 +113,7 @@ class BitLinear(nn.Linear):
     @torch.compile()
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         x = self.input_norm(x)
-        x_q, gamma = _quantize(x, is_activation=True, eps=self.eps)
+        x_q, gamma = _quantize(x, is_activation=True, eps=self.eps, conv=False)
         w_q, bias_q, beta = _quantize_weights(self.weight, self.bias, eps=self.eps)
 
         y = F.linear(x_q, w_q, bias_q)
@@ -135,7 +148,7 @@ class BitConv2d(nn.Conv2d):
     @torch.compile()
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         x = self.input_norm(x)
-        x_q, gamma = _quantize(x, is_activation=True, eps=self.eps)
+        x_q, gamma = _quantize(x, is_activation=True, eps=self.eps, conv=True)
         w_q, bias_q, beta = _quantize_weights(self.weight, self.bias, eps=self.eps)
 
         y = F.conv2d(x_q, w_q, bias_q, self.stride, self.padding, self.dilation)
@@ -146,3 +159,13 @@ class BitConv2d(nn.Conv2d):
             y = y / 127
 
         return y
+
+
+@torch.no_grad()
+def init_bitnet(module: nn.Module):
+    if isinstance(module, (BitLinear, BitConv2d)):
+        # d = torch.distributions.Laplace(0, 1 / math.sqrt(2))
+        # module.weight[...] = (
+        #     d.sample(sample_shape=module.weight.shape).reshape_as(module.weight) * 0.02
+        # )
+        module.weight.normal_(0, 0.02)

@@ -9,7 +9,7 @@ import torchvision
 import tqdm
 
 import wandb
-from bitlinear import BitConv2d, BitLinear
+from bitlinear import BitConv2d, BitLinear, init_bitnet
 
 
 class BitEuler(nn.Module):
@@ -188,9 +188,12 @@ def main():
 
     wandb.init(project="bitlinear-mnist")
     model = BitMNIST(num_classes=62).cuda()
+    model.apply(init_bitnet)
     print(f"{sum(x.numel() for x in model.parameters()) // 1000}k parameters")
+
     model = torch.compile(model)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.95)
     trainloader, testloader = _dataloaders(batch_size=2048)
 
