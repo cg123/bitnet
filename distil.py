@@ -12,7 +12,6 @@ import transformers
 from transformers.utils import is_apex_available
 
 import wandb
-from llama_rope_offset import llama_patch_rope_offset, llama_set_rope_offset
 
 if is_apex_available():
     from apex import amp
@@ -36,7 +35,6 @@ class DistillationTrainer(transformers.Trainer):
         self.loss_fct = torch.nn.KLDivLoss(reduction="batchmean")
         self.temperature = temperature
         self.kl_weight = kl_weight
-        self.rope_offset = 0
         self.sequence_length = sequence_length
         self.max_sequence_length = model.config.max_position_embeddings
 
@@ -46,13 +44,25 @@ class DistillationTrainer(transformers.Trainer):
         with torch.no_grad():
             teacher_output = self.teacher(**inputs)
 
+        attention_mask = inputs.get("attention_mask", None)
+        if attention_mask is not None:
+            # Mask out padding tokens
+            s_logits: torch.Tensor = student_output.logits
+            t_logits: torch.Tensor = teacher_output.logits
+            mask = attention_mask.unsqueeze(-1).expand_as(s_logits) > 0
+            s_logits = s_logits.masked_select(mask)
+            t_logits = t_logits.masked_select(mask)
+            s_logits = s_logits.view(-1, s_logits.size(-1))
+            t_logits = t_logits.view(-1, t_logits.size(-1))
+        else:
+            s_logits = student_output.logits
+            t_logits = teacher_output.logits
+
         distillation_loss = self.loss_fct(
-            torch.nn.functional.log_softmax(
-                student_output.logits / self.temperature, dim=-1
+            torch.nn.functional.log_softmax(s_logits / self.temperature, dim=-1),
+            torch.nn.functional.softmax(t_logits / self.temperature, dim=-1).to(
+                device=student_output.logits.device
             ),
-            torch.nn.functional.softmax(
-                teacher_output.logits / self.temperature, dim=-1
-            ).to(device=student_output.logits.device),
         ) * (self.temperature**2)
 
         student_loss = student_output.loss
@@ -61,25 +71,6 @@ class DistillationTrainer(transformers.Trainer):
         if split:
             return (loss, student_loss, distillation_loss)
         return (loss, student_output) if return_outputs else loss
-
-    def on_step_begin(
-        self,
-        _args: transformers.TrainingArguments,
-        state: transformers.TrainerState,
-        control: transformers.TrainerControl,
-        model: transformers.PreTrainedModel,
-        **kwargs,
-    ):
-        new_offset = (self.sequence_length // 2 * state.global_step) % (
-            self.max_sequence_length - self.sequence_length
-        )
-        self.rope_offset = new_offset
-        llama_set_rope_offset(model, self.rope_offset)
-
-        return control
-
-    def on_step_end(self, model, **kwargs):
-        llama_set_rope_offset(model, 0)  # in case of evaluation
 
     def training_step(self, model, inputs):
         model.train()
@@ -140,7 +131,6 @@ class DistillationTrainer(transformers.Trainer):
 )
 @click.option("--seed", type=int, default=42)
 @click.option("--save-total-limit", type=int, default=5)
-@click.option("--rope-offset/--no-rope-offset", is_flag=True, default=False)
 @click.option("--project", type=str, default=None)
 @click.option("--resume-from", type=str, default=None)
 def main(
@@ -168,7 +158,6 @@ def main(
     teacher_precision: Optional[str],
     seed: int,
     save_total_limit: int,
-    rope_offset: bool,
     project: Optional[str],
     resume_from: Optional[str],
 ):
@@ -182,14 +171,10 @@ def main(
         device_map=device,
         trust_remote_code=trust_remote_code,
         low_cpu_mem_usage=True,
+        torch_dtype=torch.bfloat16,
     )
-    if rope_offset:
-        llama_patch_rope_offset(
-            student,
-            max_position_embeddings=student.config.max_position_embeddings,
-        )
 
-    tokenizer = transformers.LlamaTokenizer.from_pretrained(
+    tokenizer = transformers.AutoTokenizer.from_pretrained(
         model, trust_remote_code=trust_remote_code
     )
     if tokenizer.pad_token_id is None:
@@ -246,7 +231,9 @@ def main(
         bf16=True,
         save_total_limit=save_total_limit,
         torch_compile=False,
-        load_best_model_at_end=True,
+        load_best_model_at_end=(
+            (eval_ds is not None) and (save_steps % eval_steps == 0)
+        ),
         resume_from_checkpoint=resume_from,
     )
 
